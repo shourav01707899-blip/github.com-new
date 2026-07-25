@@ -4,8 +4,8 @@ import websockets
 PORT = int(os.environ.get("PORT", 8765))
 
 # সব connected player
-clients = {}   # websocket → {id, state}
-# state: "waiting" বা "in_game"
+clients = {}   # websocket → {id, state, match_id}
+# state: "idle" / "waiting" / "in_game"
 
 # Waiting queue — match এর জন্য অপেক্ষা করছে
 waiting = []   # [websocket, ...]
@@ -13,7 +13,7 @@ waiting = []   # [websocket, ...]
 # Active matches
 matches = {}   # match_id → {players: [ws,...], host: id}
 
-MIN_PLAYERS = 2   # কতজন হলে match শুরু হবে (test এর জন্য ২)
+MIN_PLAYERS = 2   # কতজন হলে match শুরু হবে (পরে বাড়িয়ে ২০ করে দিতে পারেন)
 
 def new_id():
     return ''.join(random.choices(string.digits, k=6))
@@ -35,9 +35,7 @@ async def broadcast_match(match_id, data, exclude=None):
             await send(ws, data)
 
 async def try_start_match():
-    # যথেষ্ট player আছে কিনা দেখো
     while len(waiting) >= MIN_PLAYERS:
-        # প্রথম MIN_PLAYERS জনকে নিয়ে match শুরু
         match_players = waiting[:MIN_PLAYERS]
         del waiting[:MIN_PLAYERS]
 
@@ -64,7 +62,7 @@ async def try_start_match():
                 "you"      : clients[ws]["id"]
             })
 
-        print(f"[MATCH] {match_id} শুরু — players: {player_ids}")
+        print(f"[MATCH] {match_id} শুরু — players: {player_ids}, host: {host_id}")
 
 async def handle(ws):
     pid = new_id()
@@ -101,14 +99,31 @@ async def handle(ws):
                     await send(ws, {"type": "search_cancelled"})
                     print(f"[Q] {pid} queue থেকে বের হলো")
 
-            # ── Game data relay ───────────────
-            elif t == "relay":
+            # ── WebRTC Signaling: শুধু SDP offer/answer + ICE candidate ──
+            # gameplay data এখন এখান দিয়ে যাবে না — শুধু connection
+            # স্থাপনের তথ্য এখানে relay হয়। একবার WebRTC connect হয়ে
+            # গেলে players সরাসরি P2P-তে কথা বলবে, সার্ভার লাগবে না।
+            elif t == "signal":
+                mid = clients[ws].get("match_id")
+                target_id = msg.get("target_id")
+                if mid and mid in matches and target_id:
+                    for target_ws in matches[mid]["players"]:
+                        if clients[target_ws]["id"] == target_id:
+                            await send(target_ws, {
+                                "type"        : "signal",
+                                "from"        : pid,
+                                "signal_type" : msg.get("signal_type"),  # "offer" | "answer" | "ice_candidate"
+                                "data"        : msg.get("data")
+                            })
+                            break
+
+            # ── P2P connection সফল হয়েছে জানানো (optional, debug/UI-এর জন্য) ──
+            elif t == "p2p_connected":
                 mid = clients[ws].get("match_id")
                 if mid:
                     await broadcast_match(mid, {
-                        "type" : "relay",
-                        "from" : pid,
-                        "data" : msg.get("data")
+                        "type" : "player_p2p_ready",
+                        "id"   : pid
                     }, exclude=ws)
 
             # ── Ping ──────────────────────────
@@ -133,14 +148,17 @@ async def handle(ws):
                 del matches[mid]
                 print(f"[MATCH] {mid} শেষ")
             else:
-                # নতুন host বেছে দাও
-                new_host_ws = matches[mid]["players"][0]
-                new_host_id = clients[new_host_ws]["id"]
-                matches[mid]["host"] = new_host_id
-                await broadcast_match(mid, {
-                    "type"     : "host_changed",
-                    "new_host" : new_host_id
-                })
+                # host নিজেই চলে গিয়ে থাকলে নতুন host বেছে দাও
+                if matches[mid]["host"] == pid:
+                    new_host_ws = matches[mid]["players"][0]
+                    new_host_id = clients[new_host_ws]["id"]
+                    matches[mid]["host"] = new_host_id
+                    await broadcast_match(mid, {
+                        "type"     : "host_changed",
+                        "new_host" : new_host_id
+                    })
+                    print(f"[MATCH] {mid} নতুন host: {new_host_id}")
+
                 # বাকিদের জানাও
                 await broadcast_match(mid, {
                     "type"   : "player_left",
@@ -152,7 +170,7 @@ async def handle(ws):
         print(f"[-] {pid} disconnected")
 
 async def main():
-    print(f"[SERVER] Random Matchmaking চালু — port {PORT}")
+    print(f"[SERVER] WebRTC Signaling + Matchmaking চালু — port {PORT}")
     print(f"[SERVER] Min players per match: {MIN_PLAYERS}")
     async with websockets.serve(handle, "0.0.0.0", PORT):
         await asyncio.Future()
