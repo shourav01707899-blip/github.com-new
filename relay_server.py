@@ -6,13 +6,12 @@ PORT = int(os.environ.get("PORT", 8765))
 # সব connected player
 clients = {}   # websocket → {id, state, match_id, score}
 # state: "idle" / "waiting" / "in_game"
-# score: ক্লায়েন্টের নিজের রিপোর্ট করা নেট/ডিভাইস quality — বেশি = ভালো host candidate
 
-waiting = []   # [websocket, ...]  matchমেকিং queue
+waiting = []   # matchmaking queue: [websocket, ...]
 
 matches = {}   # match_id → {players: [ws,...], host: id, peer_map: {server_id: multiplayer_id}}
 
-MIN_PLAYERS = 2   # কতজন হলে match শুরু হবে
+MIN_PLAYERS = 2
 
 
 def new_id():
@@ -39,11 +38,8 @@ async def broadcast_match(match_id, data, exclude=None):
 
 
 def build_peer_map(host_ws, other_ws_list):
-    """
-    host সবসময় Godot multiplayer id 1 পায় (WebRTCMultiplayerPeer-এ server = id 1)।
-    বাকিদের score অনুযায়ী (বেশি score আগে) 2, 3, 4... করে ID দেওয়া হয় —
-    যাতে সবার কাছে deterministic একই map যায়।
-    """
+    """host সবসময় Godot multiplayer id 1 (WebRTCMultiplayerPeer-এ server = 1)।
+    বাকিদের score অনুযায়ী (বেশি score আগে) 2, 3, 4... — সবার কাছে একই deterministic map যাবে।"""
     peer_map = {clients[host_ws]["id"]: 1}
     ordered = sorted(other_ws_list, key=lambda w: clients[w]["score"], reverse=True)
     for i, ws in enumerate(ordered, start=2):
@@ -104,7 +100,6 @@ async def handle(ws):
 
             # ── Matchmaking শুরু ──────────────
             if t == "find_match":
-                # ক্লায়েন্ট নিজের নেট/ডিভাইস quality score পাঠায় — host বাছাইয়ে ব্যবহার হবে
                 try:
                     clients[ws]["score"] = float(msg.get("score", 0))
                 except (TypeError, ValueError):
@@ -113,10 +108,7 @@ async def handle(ws):
                 if ws not in waiting and clients[ws]["state"] == "idle":
                     waiting.append(ws)
                     clients[ws]["state"] = "waiting"
-                    await send(ws, {
-                        "type":    "searching",
-                        "waiting": len(waiting)
-                    })
+                    await send(ws, {"type": "searching", "waiting": len(waiting)})
                     print(f"[Q] {pid} queue তে ঢুকলো (score={clients[ws]['score']:.1f}) — total: {len(waiting)}")
                     await try_start_match()
 
@@ -128,7 +120,7 @@ async def handle(ws):
                     await send(ws, {"type": "search_cancelled"})
                     print(f"[Q] {pid} queue থেকে বের হলো")
 
-            # ── WebRTC Signaling relay ────────
+            # ── WebRTC signaling relay (শুধু handshake — offer/answer/ice) ──
             elif t == "signal":
                 mid = clients[ws].get("match_id")
                 target_id = msg.get("target_id")
@@ -143,16 +135,16 @@ async def handle(ws):
                             })
                             break
 
-            # ── debug/UI info ──────────────────
-            elif t == "p2p_connected":
+            # ── Gameplay ডাটা ফলব্যাক (WebRTC রেডি না হলে সাময়িক) ──
+            elif t == "relay":
                 mid = clients[ws].get("match_id")
-                if mid:
+                if mid and mid in matches:
                     await broadcast_match(mid, {
-                        "type": "player_p2p_ready",
-                        "id":   pid
+                        "type": "relay",
+                        "from": pid,
+                        "data": msg.get("data")
                     }, exclude=ws)
 
-            # ── Ping (latency মাপার জন্যও ব্যবহার হয়) ──
             elif t == "ping":
                 await send(ws, {"type": "pong"})
 
@@ -168,15 +160,15 @@ async def handle(ws):
             matches[mid]["players"] = [
                 w for w in matches[mid]["players"] if w != ws
             ]
+            alive = len(matches[mid]["players"])
 
-            if len(matches[mid]["players"]) == 0:
+            if alive == 0:
                 del matches[mid]
                 print(f"[MATCH] {mid} শেষ")
             else:
                 remaining = matches[mid]["players"]
 
                 if was_host:
-                    # host চলে গেছে — বাকিদের মধ্যে সবচেয়ে ভালো score-ওয়ালা নতুন host
                     new_host_ws = max(remaining, key=lambda w: clients[w]["score"])
                     new_host_id = clients[new_host_ws]["id"]
                     new_peer_map = build_peer_map(
@@ -187,17 +179,16 @@ async def handle(ws):
                     matches[mid]["peer_map"] = new_peer_map
 
                     await broadcast_match(mid, {
-                        "type":     "host_migrated",
-                        "host":     new_host_id,
+                        "type":     "host_changed",
+                        "new_host": new_host_id,
                         "peer_map": new_peer_map,
                     })
                     print(f"[MATCH] {mid} — host সরে যাওয়ায় নতুন host: {new_host_id}")
                 else:
-                    # সাধারণ প্লেয়ার চলে গেলে topology ভাঙার দরকার নেই,
-                    # host একাই সবার সাথে connected — শুধু জানিয়ে দাও
                     await broadcast_match(mid, {
-                        "type": "player_left",
-                        "id":   pid,
+                        "type":  "player_left",
+                        "id":    pid,
+                        "alive": alive,
                     })
 
         del clients[ws]
